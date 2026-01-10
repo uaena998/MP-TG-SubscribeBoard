@@ -1,37 +1,25 @@
 // ============================================
-// MP-TG-SubscribeBoard (Forever Single Dashboard Message, Free Plan Friendly)
-//
-// ✅ Telegram: parse_mode HTML + safe escaping
-// ✅ Concurrency: Durable Object (SQLite-backed on Free plan) => strong consistency
-// ✅ Forever single dashboard message: keep messageId; cross-day reset content only
-// ✅ Adopt pinned dashboard message: supports pinned text OR pinned caption
-// ✅ Strict mode: do NOT fallback-send new message (unless forced "caption->text upgrade")
-// ✅ URL whitelist for <a href>: only http/https
-// ✅ Length guard + Telegram "too long" retry shrink
-// ✅ Caption trap: if adopted message is caption and hits 1024, auto-upgrade to text message
-//    (best-effort pin new + unpin old; requires bot permissions)
-//
-// Env vars (recommended defaults):
-//   TIME_ZONE=Asia/Shanghai
-//   STRICT_SINGLE_MESSAGE=1
-//   ADOPT_PINNED=1
-//   AUTO_PIN=0 or 1
-//   SHOW_IMAGE_LINK=1
-//   ALLOW_CAPTION_UPGRADE=1
+// MP-TG-SubscribeBoard (Photo Dashboard Edition)
+// - Dashboard is a SINGLE Telegram message forever
+// - Prefer a PHOTO message so "代表图" is shown as image (no URL displayed)
+// - Durable Object serializes updates (Cloudflare Free plan: SQLite-backed DO)
+// - HTML parse_mode with safe escaping
+// - Caption length guard (1024) + Telegram "too long" retry with shorter template
+// - If existing dashboard is TEXT, can do a ONE-TIME upgrade to PHOTO (configurable)
 // ============================================
 
 const DEFAULT_TIME_ZONE = "Asia/Shanghai";
 const TV_LINE_PREFIX_RE = /^📺[\uFE0E\uFE0F]?/; // 📺︎ / 📺️ / 📺
 
-// Telegram limits (after entities parsing)
+// Telegram limits
 const TG_TEXT_LIMIT = 4096;
 const TG_CAPTION_LIMIT = 1024;
 
-// Retry shrink margin (to account for Telegram entity counting differences)
-const SHRINK_MARGIN_TEXT = 600;
-const SHRINK_MARGIN_CAPTION = 300;
+// Safety margins for retry
+const CAPTION_SAFE_BUDGET = 900;
+const CAPTION_AGGRESSIVE_BUDGET = 700;
+const CAPTION_MIN_BUDGET = 420;
 
-// Collator cache for safe sorting
 let _collatorZh = null;
 let _collatorDefault = null;
 
@@ -44,8 +32,12 @@ export default {
       return new Response("Unauthorized", { status: 401 });
     }
 
-    if (request.method === "GET") return new Response("Worker OK", { status: 200 });
-    if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+    if (request.method === "GET") {
+      return new Response("Worker OK", { status: 200 });
+    }
+    if (request.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
 
     try {
       const payload = await request.json();
@@ -66,7 +58,6 @@ export default {
       const timeZone = env.TIME_ZONE || DEFAULT_TIME_ZONE;
       const dateKey = formatDateKey(new Date(), timeZone);
 
-      // One DO instance per chat
       const doId = env.SUBSCRIBE_BOARD.idFromName(String(env.CHAT_ID));
       const stub = env.SUBSCRIBE_BOARD.get(doId);
 
@@ -94,7 +85,7 @@ export class SubscribeBoardDO {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.queue = Promise.resolve(); // serialize tasks
+    this.queue = Promise.resolve();
   }
 
   async fetch(request) {
@@ -102,7 +93,7 @@ export class SubscribeBoardDO {
 
     const input = await request.json();
     const task = this.queue.then(() => this.handleAggregate(input));
-    this.queue = task.catch(() => {}); // keep queue alive
+    this.queue = task.catch(() => {});
 
     try {
       const result = await task;
@@ -123,48 +114,52 @@ export class SubscribeBoardDO {
     const strict = (this.env.STRICT_SINGLE_MESSAGE ?? "1") !== "0"; // default ON
     const adoptPinned = (this.env.ADOPT_PINNED ?? "1") !== "0"; // default ON
     const autoPin = (this.env.AUTO_PIN ?? "0") === "1";
-    const showImageLink = (this.env.SHOW_IMAGE_LINK ?? "1") !== "0"; // default ON
-    const allowCaptionUpgrade = (this.env.ALLOW_CAPTION_UPGRADE ?? "1") !== "0"; // default ON
+
+    const preferPhoto = (this.env.PREFER_PHOTO_MESSAGE ?? "1") !== "0"; // default ON
+    const allowTextToPhotoUpgrade = (this.env.ALLOW_TEXT_TO_PHOTO_UPGRADE ?? "1") !== "0"; // default ON
 
     const { dateKey, items, image } = input || {};
     if (!dateKey || !Array.isArray(items)) throw new Error("Invalid payload to Durable Object");
 
     let state = (await this.state.storage.get("state")) || null;
 
-    // Init/back-compat normalize
+    // init/back-compat
     if (!state || typeof state !== "object") {
       state = {
-        messageId: null,           // forever
-        messageKind: "text",       // "text" | "caption"
+        messageId: null,
+        messageKind: "unknown", // "photo" | "text" | "unknown"
         dateKey: null,
         content: [],
-        image: "",
+        // photoUrl: currently used photo in the dashboard message (if known / set by us)
+        photoUrl: "",
+        // dayImage: selected image for current day (used to update media at most once/day)
+        dayImage: "",
       };
     } else {
-      if (!state.messageKind) state.messageKind = "text";
       if (!Array.isArray(state.content)) state.content = [];
-      if (typeof state.image !== "string") state.image = "";
+      if (!state.messageKind) state.messageKind = "unknown";
+      if (typeof state.photoUrl !== "string") state.photoUrl = "";
+      if (typeof state.dayImage !== "string") state.dayImage = "";
     }
 
     let changed = false;
 
-    // Cross-day reset CONTENT only (keep messageId/kind)
+    // Cross-day reset CONTENT only; keep messageId forever.
+    // For photo: we keep photoUrl (so message always has an image), but reset dayImage for daily selection.
     if (state.dateKey !== dateKey) {
       state.dateKey = dateKey;
       state.content = [];
-      state.image = "";
-      changed = true; // ensure first webhook of day updates
+      state.dayImage = "";
+      changed = true; // ensure first webhook updates dashboard
     }
 
     // Merge items
     for (const it of items) {
       if (!it || typeof it !== "object") continue;
-
       const title = String(it.title || "").trim();
       const year = String(it.year || "").trim();
       const season = String(it.season || "").trim().toUpperCase();
       const episode = String(it.episode || "").trim().toUpperCase();
-
       if (!title || !year || !season || !episode) continue;
 
       const key = `${title}|${year}|${season}`;
@@ -174,67 +169,65 @@ export class SubscribeBoardDO {
       if (idx === -1) {
         state.content.push(normalized);
         changed = true;
-      } else {
-        if (String(episode).length > String(state.content[idx].episode || "").length) {
-          state.content[idx] = normalized;
-          changed = true;
-        }
+      } else if (String(episode).length > String(state.content[idx].episode || "").length) {
+        state.content[idx] = normalized;
+        changed = true;
       }
     }
 
-    // Stable sort with safe locale fallback
     safeSortContent(state.content);
 
-    // Daily cover: first valid http/https
-    const safeImage = sanitizeHttpUrl(image);
-    if (!state.image && safeImage) {
-      state.image = safeImage;
+    // Daily representative image: pick the first valid http/https we receive today
+    const safeIncoming = sanitizeHttpUrl(image);
+    if (!state.dayImage && safeIncoming) {
+      state.dayImage = safeIncoming;
       changed = true;
     }
 
+    // If nothing changed and we already have a message, skip Telegram call
     if (!changed && state.messageId) {
       return { ok: true, skipped: true, reason: "No update needed", messageId: state.messageId };
     }
 
     const updatedAt = formatDateTime(new Date(), timeZone);
 
-    // Build HTML with budget based on message kind
-    const kind = state.messageKind === "caption" ? "caption" : "text";
-    const limit = kind === "caption" ? TG_CAPTION_LIMIT : TG_TEXT_LIMIT;
-
-    const html = buildDashboardHtml({
+    // Build caption templates (no URL line; photo itself is the cover)
+    const captionFull = buildCaptionHtml({
       dateKey: state.dateKey,
       updatedAt,
       content: state.content,
-      imageUrl: showImageLink ? state.image : "",
-      budget: limit,
+      budget: CAPTION_SAFE_BUDGET,
     });
 
-    const shrinkBudget =
-      kind === "caption"
-        ? Math.max(200, TG_CAPTION_LIMIT - SHRINK_MARGIN_CAPTION)
-        : Math.max(400, TG_TEXT_LIMIT - SHRINK_MARGIN_TEXT);
-
-    const htmlShort = buildDashboardHtml({
+    const captionAggressive = buildCaptionHtml({
       dateKey: state.dateKey,
       updatedAt,
       content: state.content,
-      imageUrl: "", // aggressive: drop link
-      budget: shrinkBudget,
+      budget: CAPTION_AGGRESSIVE_BUDGET,
       aggressive: true,
     });
 
-    // Upsert Telegram
-    const action = await upsertForeverSingleMessage({
+    const captionMinimal = buildCaptionHtml({
+      dateKey: state.dateKey,
+      updatedAt,
+      content: state.content,
+      budget: CAPTION_MIN_BUDGET,
+      aggressive: true,
+      minimal: true,
+    });
+
+    const action = await upsertPhotoDashboard({
       token: BOT_TOKEN,
       chatId: CHAT_ID,
       state,
-      html,
-      htmlShort,
+      preferPhoto,
+      allowTextToPhotoUpgrade,
       strict,
       adoptPinned,
       autoPin,
-      allowCaptionUpgrade,
+      captionFull,
+      captionAggressive,
+      captionMinimal,
     });
 
     await this.state.storage.put("state", state);
@@ -243,18 +236,20 @@ export class SubscribeBoardDO {
 }
 
 // ============================================
-// Telegram upsert (forever single dashboard message)
+// Telegram: Always keep ONE message, prefer PHOTO
 // ============================================
-async function upsertForeverSingleMessage({
+async function upsertPhotoDashboard({
   token,
   chatId,
   state,
-  html,
-  htmlShort,
+  preferPhoto,
+  allowTextToPhotoUpgrade,
   strict,
   adoptPinned,
   autoPin,
-  allowCaptionUpgrade,
+  captionFull,
+  captionAggressive,
+  captionMinimal,
 }) {
   const tryAdopt = async () => {
     if (!adoptPinned) return null;
@@ -263,12 +258,15 @@ async function upsertForeverSingleMessage({
 
     const extracted = extractPinnedTextOrCaption(pinned);
     if (!extracted) return null;
-
     if (!looksLikeDashboard(extracted.text)) return null;
-    return { messageId: pinned.message_id, messageKind: extracted.kind };
+
+    return {
+      messageId: pinned.message_id,
+      messageKind: extracted.kind === "caption" ? "photo" : "text",
+    };
   };
 
-  // 0) adopt pinned if no messageId
+  // Adopt if needed
   if (!state.messageId) {
     const adopted = await tryAdopt();
     if (adopted) {
@@ -277,201 +275,198 @@ async function upsertForeverSingleMessage({
     }
   }
 
-  // 1) create initial message if none (allowed even in strict)
+  // Decide intended mode
+  const wantPhoto = preferPhoto;
+
+  // If no message exists: create initial dashboard
   if (!state.messageId) {
-    const messageId = await telegramCall(token, "sendMessage", {
+    if (wantPhoto) {
+      const photo = pickPhotoForSend(state);
+      if (!photo) {
+        // No photo available yet => fallback to text for first send (still one message).
+        // Next time we can upgrade to photo if allowed.
+        const msgId = await telegramCall(token, "sendMessage", {
+          chat_id: chatId,
+          text: stripAllTags(captionFull), // show clean text version
+          parse_mode: "HTML",
+          disable_notification: true,
+        });
+        state.messageId = msgId;
+        state.messageKind = "text";
+        if (autoPin) await bestEffortPin(token, chatId, msgId);
+        return { type: "sendMessage", messageId: msgId, note: "no_photo_yet" };
+      }
+
+      const msgId = await telegramCall(token, "sendPhoto", {
+        chat_id: chatId,
+        photo,
+        caption: captionFull,
+        parse_mode: "HTML",
+        disable_notification: true,
+      });
+      state.messageId = msgId;
+      state.messageKind = "photo";
+      state.photoUrl = photo;
+      if (autoPin) await bestEffortPin(token, chatId, msgId);
+      return { type: "sendPhoto", messageId: msgId };
+    } else {
+      const msgId = await telegramCall(token, "sendMessage", {
+        chat_id: chatId,
+        text: stripAllTags(captionFull),
+        parse_mode: "HTML",
+        disable_notification: true,
+      });
+      state.messageId = msgId;
+      state.messageKind = "text";
+      if (autoPin) await bestEffortPin(token, chatId, msgId);
+      return { type: "sendMessage", messageId: msgId };
+    }
+  }
+
+  // If we want PHOTO but current is TEXT, we need one-time upgrade (sendPhoto once)
+  if (wantPhoto && state.messageKind === "text") {
+    if (!allowTextToPhotoUpgrade) {
+      if (strict) {
+        throw new Error("PREFER_PHOTO_MESSAGE=1 but dashboard is text and ALLOW_TEXT_TO_PHOTO_UPGRADE=0 (strict).");
+      }
+      // non-strict: keep editing as text
+      return await editTextDashboard(token, chatId, state, captionFull, captionAggressive, captionMinimal);
+    }
+
+    const photo = pickPhotoForSend(state);
+    if (!photo) {
+      // no photo available => keep as text for now
+      return await editTextDashboard(token, chatId, state, captionFull, captionAggressive, captionMinimal);
+    }
+
+    // ONE-TIME upgrade: send a new photo dashboard message, then (optionally) pin it.
+    const oldId = state.messageId;
+    const newId = await telegramCall(token, "sendPhoto", {
       chat_id: chatId,
-      text: html,
+      photo,
+      caption: captionFull,
       parse_mode: "HTML",
       disable_notification: true,
     });
-    state.messageId = messageId;
-    state.messageKind = "text";
 
-    if (autoPin) await bestEffortPin(token, chatId, messageId);
-    return { type: "sendMessage", messageId, adoptedPinned: false };
+    state.messageId = newId;
+    state.messageKind = "photo";
+    state.photoUrl = photo;
+
+    if (autoPin) {
+      await bestEffortPin(token, chatId, newId);
+      await bestEffortUnpin(token, chatId, oldId);
+    }
+
+    return { type: "upgrade_text_to_photo", oldMessageId: oldId, newMessageId: newId, pinned: autoPin };
   }
 
-  // 2) edit forever
-  const edit = async (payloadHtml) => {
-    if (state.messageKind === "caption") {
-      await telegramCall(
-        token,
-        "editMessageCaption",
-        {
-          chat_id: chatId,
-          message_id: state.messageId,
-          caption: payloadHtml,
-          parse_mode: "HTML",
-        },
-        { allowNotModified: true }
-      );
-      return { type: "editMessageCaption", messageId: state.messageId };
-    } else {
+  // If current is PHOTO: edit caption (and update media once/day if new dayImage exists)
+  if (state.messageKind === "photo") {
+    return await editPhotoDashboard(token, chatId, state, captionFull, captionAggressive, captionMinimal);
+  }
+
+  // Otherwise: edit as text
+  return await editTextDashboard(token, chatId, state, captionFull, captionAggressive, captionMinimal);
+}
+
+function pickPhotoForSend(state) {
+  // Prefer today's chosen image; otherwise keep existing photoUrl (so always has cover)
+  const today = sanitizeHttpUrl(state.dayImage);
+  if (today) return today;
+  const old = sanitizeHttpUrl(state.photoUrl);
+  if (old) return old;
+  return "";
+}
+
+async function editPhotoDashboard(token, chatId, state, full, aggressive, minimal) {
+  const desiredPhoto = pickPhotoForSend(state);
+  const shouldUpdateMedia = desiredPhoto && desiredPhoto !== state.photoUrl && sanitizeHttpUrl(state.dayImage);
+
+  // Try sequence: full -> aggressive -> minimal (too long / parse errors)
+  const attempts = [full, aggressive, minimal];
+
+  for (let i = 0; i < attempts.length; i++) {
+    const cap = attempts[i];
+    try {
+      if (shouldUpdateMedia) {
+        await telegramCall(
+          token,
+          "editMessageMedia",
+          {
+            chat_id: chatId,
+            message_id: state.messageId,
+            media: {
+              type: "photo",
+              media: desiredPhoto,
+              caption: cap,
+              parse_mode: "HTML",
+            },
+          },
+          { allowNotModified: true }
+        );
+        state.photoUrl = desiredPhoto;
+      } else {
+        await telegramCall(
+          token,
+          "editMessageCaption",
+          {
+            chat_id: chatId,
+            message_id: state.messageId,
+            caption: cap,
+            parse_mode: "HTML",
+          },
+          { allowNotModified: true }
+        );
+      }
+      return { type: shouldUpdateMedia ? "editMessageMedia" : "editMessageCaption", messageId: state.messageId, attempt: i + 1 };
+    } catch (e) {
+      const msg = String(e?.message || e);
+      if (i === attempts.length - 1) throw e;
+
+      // If parse error, remove all tags and retry next attempt (still HTML-safe)
+      if (isParseEntityError(msg)) {
+        attempts[i + 1] = stripAllTags(attempts[i + 1]);
+      }
+      // If too long, just proceed to a shorter attempt
+      continue;
+    }
+  }
+}
+
+async function editTextDashboard(token, chatId, state, full, aggressive, minimal) {
+  // For text messages we send plain (no image), but user wants photo, so this is fallback-only.
+  const textFull = stripAllTags(full);
+  const textAgg = stripAllTags(aggressive);
+  const textMin = stripAllTags(minimal);
+
+  const attempts = [textFull, textAgg, textMin];
+
+  for (let i = 0; i < attempts.length; i++) {
+    const text = hardTrimToChars(attempts[i], Math.min(TG_TEXT_LIMIT, 3500));
+    try {
       await telegramCall(
         token,
         "editMessageText",
         {
           chat_id: chatId,
           message_id: state.messageId,
-          text: payloadHtml,
+          text,
           parse_mode: "HTML",
         },
         { allowNotModified: true }
       );
-      return { type: "editMessageText", messageId: state.messageId };
+      return { type: "editMessageText", messageId: state.messageId, attempt: i + 1 };
+    } catch (e) {
+      if (i === attempts.length - 1) throw e;
+      continue;
     }
-  };
-
-  // Helper: upgrade caption -> text (creates ONE new dashboard message, then forever edits it)
-  const upgradeCaptionToText = async (payloadHtml, reason) => {
-    if (!allowCaptionUpgrade) {
-      throw new Error(`Caption message hit limit but ALLOW_CAPTION_UPGRADE=0. Reason: ${reason}`);
-    }
-
-    const oldId = state.messageId;
-
-    // send new text dashboard
-    const newId = await telegramCall(token, "sendMessage", {
-      chat_id: chatId,
-      text: payloadHtml,
-      parse_mode: "HTML",
-      disable_notification: true,
-    });
-
-    // optionally pin new; best-effort unpin old
-    if (autoPin) {
-      await bestEffortPin(token, chatId, newId);
-      await bestEffortUnpin(token, chatId, oldId);
-    }
-
-    state.messageId = newId;
-    state.messageKind = "text";
-
-    return { type: "upgrade_caption_to_text", oldMessageId: oldId, newMessageId: newId, pinned: autoPin };
-  };
-
-  // 2.1 normal edit attempt
-  try {
-    return await edit(html);
-  } catch (err1) {
-    const msg1 = String(err1?.message || err1);
-
-    // 2.2 If Telegram says "too long" (or similar), retry with shorter HTML
-    if (isTooLongError(msg1)) {
-      try {
-        return await edit(htmlShort);
-      } catch (err2) {
-        const msg2 = String(err2?.message || err2);
-
-        // If caption trap: try upgrade
-        if (state.messageKind === "caption" && isTooLongError(msg2)) {
-          return await upgradeCaptionToText(htmlShort, msg2);
-        }
-
-        if (strict) {
-          throw new Error(`STRICT_SINGLE_MESSAGE: edit failed (too long) and fallback-send disabled. Cause: ${msg2}`);
-        }
-        // non-strict fallback (not recommended)
-        return await fallbackSendNewText(token, chatId, state, htmlShort, autoPin);
-      }
-    }
-
-    // 2.3 If HTML parsing fails, retry without links (and then with htmlShort)
-    if (isParseEntityError(msg1)) {
-      const noLinks = stripLinksFromHtml(html);
-      try {
-        return await edit(noLinks);
-      } catch (err3) {
-        const msg3 = String(err3?.message || err3);
-
-        // try shorter (no links already)
-        try {
-          const noLinksShort = stripLinksFromHtml(htmlShort);
-          return await edit(noLinksShort);
-        } catch (err4) {
-          const msg4 = String(err4?.message || err4);
-
-          // caption upgrade if caption parse keeps failing
-          if (state.messageKind === "caption") {
-            return await upgradeCaptionToText(stripLinksFromHtml(htmlShort), msg4);
-          }
-
-          if (strict) {
-            throw new Error(`STRICT_SINGLE_MESSAGE: edit failed (parse) and fallback disabled. Cause: ${msg4}`);
-          }
-          return await fallbackSendNewText(token, chatId, state, stripLinksFromHtml(htmlShort), autoPin);
-        }
-      }
-    }
-
-    // 2.4 maybe pinned changed: re-adopt once and retry
-    const adopted = await tryAdopt();
-    if (adopted && adopted.messageId && adopted.messageId !== state.messageId) {
-      state.messageId = adopted.messageId;
-      state.messageKind = adopted.messageKind;
-      try {
-        return await edit(html);
-      } catch (err5) {
-        const msg5 = String(err5?.message || err5);
-
-        // if adopted caption causes issues, try upgrade
-        if (state.messageKind === "caption" && (isTooLongError(msg5) || isParseEntityError(msg5))) {
-          return await upgradeCaptionToText(htmlShort, msg5);
-        }
-
-        if (strict) throw new Error(`STRICT_SINGLE_MESSAGE: edit failed after re-adopt. Cause: ${msg5}`);
-        return await fallbackSendNewText(token, chatId, state, htmlShort, autoPin);
-      }
-    }
-
-    // 2.5 last: strict/no-strict
-    if (state.messageKind === "caption" && (isTooLongError(msg1) || isParseEntityError(msg1))) {
-      return await upgradeCaptionToText(htmlShort, msg1);
-    }
-
-    if (strict) throw new Error(`STRICT_SINGLE_MESSAGE: edit failed and fallback disabled. Cause: ${msg1}`);
-    return await fallbackSendNewText(token, chatId, state, htmlShort, autoPin);
   }
 }
 
-async function fallbackSendNewText(token, chatId, state, html, autoPin) {
-  const messageId = await telegramCall(token, "sendMessage", {
-    chat_id: chatId,
-    text: html,
-    parse_mode: "HTML",
-    disable_notification: true,
-  });
-  state.messageId = messageId;
-  state.messageKind = "text";
-  if (autoPin) await bestEffortPin(token, chatId, messageId);
-  return { type: "sendMessage", messageId, fallback: true };
-}
-
-async function bestEffortPin(token, chatId, messageId) {
-  try {
-    await telegramCall(token, "pinChatMessage", {
-      chat_id: chatId,
-      message_id: messageId,
-      disable_notification: true,
-    });
-  } catch (e) {
-    console.warn("AUTO_PIN failed:", e?.message || e);
-  }
-}
-
-async function bestEffortUnpin(token, chatId, messageId) {
-  try {
-    // message_id is optional in some implementations; we pass explicitly for safety
-    await telegramCall(token, "unpinChatMessage", {
-      chat_id: chatId,
-      message_id: messageId,
-    });
-  } catch (e) {
-    console.warn("AUTO_UNPIN failed:", e?.message || e);
-  }
-}
-
+// ============================================
+// Pinned adopt helpers
+// ============================================
 async function tryGetPinnedMessage(token, chatId) {
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/getChat`, {
@@ -488,39 +483,115 @@ async function tryGetPinnedMessage(token, chatId) {
 }
 
 function extractPinnedTextOrCaption(pinned) {
-  if (typeof pinned?.text === "string" && pinned.text.trim()) {
-    return { kind: "text", text: pinned.text };
-  }
-  if (typeof pinned?.caption === "string" && pinned.caption.trim()) {
-    return { kind: "caption", text: pinned.caption };
-  }
+  if (typeof pinned?.text === "string" && pinned.text.trim()) return { kind: "text", text: pinned.text };
+  if (typeof pinned?.caption === "string" && pinned.caption.trim()) return { kind: "caption", text: pinned.caption };
   return null;
 }
 
 function looksLikeDashboard(text) {
   const t = String(text || "");
   if (!t.includes("今日电视剧更新")) return false;
-  if (!t.includes("更新于")) return false;
-  if (!t.includes("═══════════════")) return false;
-  const hasTv = t.split("\n").some((l) => String(l).trim().startsWith("📺"));
-  return hasTv;
+  if (!t.includes("📺")) return false;
+  return true;
 }
 
-function stripLinksFromHtml(html) {
-  return String(html || "").replace(/<a\s+href="[^"]*">([\s\S]*?)<\/a>/gi, "$1");
+async function bestEffortPin(token, chatId, messageId) {
+  try {
+    await telegramCall(token, "pinChatMessage", {
+      chat_id: chatId,
+      message_id: messageId,
+      disable_notification: true,
+    });
+  } catch {}
 }
 
-function isTooLongError(msg) {
-  const m = String(msg || "").toLowerCase();
-  return (
-    m.includes("too long") ||
-    m.includes("message is too long") ||
-    m.includes("message_text is too long") ||
-    m.includes("message caption is too long") ||
-    m.includes("caption is too long")
-  );
+async function bestEffortUnpin(token, chatId, messageId) {
+  try {
+    await telegramCall(token, "unpinChatMessage", {
+      chat_id: chatId,
+      message_id: messageId,
+    });
+  } catch {}
 }
 
+// ============================================
+// Caption building (no URL line)
+// ============================================
+function buildCaptionHtml({ dateKey, updatedAt, content, budget, aggressive = false, minimal = false }) {
+  // Cleaner layout: title + meta line + blank + list
+  const header = `🎬 <b>今日电视剧更新</b>`;
+  const meta = `🗓 <b>${escapeHtml(dateKey)}</b>  ·  ⏱ <i>${escapeHtml(updatedAt)}</i>`;
+
+  const lines = (content || []).map(({ title, year, season, episode }) => {
+    return `📺 <b>${escapeHtml(title)}</b> (${escapeHtml(year)}) ${escapeHtml(season)}${escapeHtml(episode)}`;
+  });
+
+  const placeholder = "（今日暂无更新）";
+  const body = lines.length ? lines : [placeholder];
+
+  if (minimal) {
+    // extreme fallback: only show first few lines
+    const prefix = [header, meta, ""];
+    const suffix = [];
+    return fitLinesToBudget(prefix, body, suffix, budget) || hardTrimVisible(`${header}\n${meta}`, budget);
+  }
+
+  const prefix = aggressive ? [header, meta, ""] : [header, meta, ""];
+  const suffix = []; // no separators to keep it compact
+
+  return fitLinesToBudget(prefix, body, suffix, budget) || hardTrimVisible(`${header}\n${meta}`, budget);
+}
+
+function fitLinesToBudget(prefixLines, bodyLines, suffixLines, budget) {
+  const max = bodyLines.length;
+
+  for (let n = max; n >= 0; n--) {
+    const hidden = max - n;
+    const lines = [...prefixLines, ...bodyLines.slice(0, n)];
+
+    if (hidden > 0) lines.push(`<i>…以及 ${hidden} 条未显示</i>`);
+    lines.push(...suffixLines);
+
+    const html = lines.join("\n");
+    if (visibleTextLength(html) <= budget) return html;
+  }
+  return null;
+}
+
+function visibleTextLength(html) {
+  let t = String(html || "").replace(/<[^>]*>/g, "");
+  t = t
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+  t = t.replace(/&[#a-zA-Z0-9]+;/g, "X");
+  return t.length;
+}
+
+function hardTrimVisible(html, budget) {
+  let lines = String(html || "").split("\n");
+  while (lines.length > 1 && visibleTextLength(lines.join("\n")) > budget) {
+    lines.pop();
+  }
+  return lines.join("\n");
+}
+
+function stripAllTags(html) {
+  // Keep HTML-escaped text; remove tags entirely
+  return String(html || "").replace(/<[^>]*>/g, "");
+}
+
+function hardTrimToChars(text, maxChars) {
+  const s = String(text || "");
+  if (s.length <= maxChars) return s;
+  return s.slice(0, Math.max(0, maxChars - 20)) + "\n…";
+}
+
+// ============================================
+// Telegram call + errors
+// ============================================
 function isParseEntityError(msg) {
   const m = String(msg || "").toLowerCase();
   return m.includes("can't parse entities") || m.includes("parse entities") || m.includes("entity") || m.includes("html");
@@ -548,92 +619,6 @@ async function telegramCall(token, method, body, opts = {}) {
 }
 
 // ============================================
-// Message building with budget + aggressive trimming
-// ============================================
-function buildDashboardHtml({ dateKey, updatedAt, content, imageUrl, budget, aggressive = false }) {
-  const header = `🎬 <b>今日电视剧更新</b>`;
-  const dateLine = `📅 <b>${escapeHtml(dateKey)}</b>`;
-  const sep = `═══════════════`;
-  const updatedLine = `⏳ <i>更新于: ${escapeHtml(updatedAt)}</i>`;
-
-  const safeUrl = sanitizeHttpUrl(imageUrl);
-  const imgLine = safeUrl ? `🖼 <a href="${escapeHtmlAttr(safeUrl)}">代表图</a>` : "";
-
-  const bodyLines = (content || []).map(({ title, year, season, episode }) => {
-    return `📺 <b>${escapeHtml(title)}</b> (${escapeHtml(year)}) ${escapeHtml(season)}${escapeHtml(episode)}`;
-  });
-
-  const placeholder = "（今日暂无更新）";
-  const body = bodyLines.length ? bodyLines : [placeholder];
-
-  const strategies = aggressive
-    ? [
-        { useDate: true, useImg: false, useSep: true },
-        { useDate: false, useImg: false, useSep: true },
-        { useDate: false, useImg: false, useSep: false },
-      ]
-    : [
-        { useDate: true, useImg: true, useSep: true },
-        { useDate: true, useImg: false, useSep: true },
-        { useDate: false, useImg: false, useSep: true },
-      ];
-
-  for (const s of strategies) {
-    const prefix = [
-      header,
-      ...(s.useDate ? [dateLine] : []),
-      ...(s.useImg && imgLine ? [imgLine] : []),
-      ...(s.useSep ? [sep] : []),
-      "",
-    ];
-    const suffix = ["", ...(s.useSep ? [sep] : []), updatedLine];
-
-    const fitted = fitLinesToBudget(prefix, body, suffix, budget);
-    if (fitted) return fitted;
-  }
-
-  // last resort minimal
-  const minimal = `${header}\n${updatedLine}`;
-  return hardTrimVisible(minimal, budget);
-}
-
-function fitLinesToBudget(prefixLines, bodyLines, suffixLines, budget) {
-  const max = bodyLines.length;
-
-  for (let n = max; n >= 0; n--) {
-    const hidden = max - n;
-    const lines = [...prefixLines, ...bodyLines.slice(0, n)];
-
-    if (hidden > 0) lines.push(`<i>…以及 ${hidden} 条未显示</i>`);
-    lines.push(...suffixLines);
-
-    const html = lines.join("\n");
-    if (visibleTextLength(html) <= budget) return html;
-  }
-  return null;
-}
-
-function hardTrimVisible(html, budget) {
-  let lines = String(html || "").split("\n");
-  while (lines.length > 1 && visibleTextLength(lines.join("\n")) > budget) {
-    lines.pop();
-  }
-  return lines.join("\n");
-}
-
-function visibleTextLength(html) {
-  let t = String(html || "").replace(/<[^>]*>/g, "");
-  t = t
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-  t = t.replace(/&[#a-zA-Z0-9]+;/g, "X");
-  return t.length;
-}
-
-// ============================================
 // Sorting (safe locale fallback)
 // ============================================
 function safeSortContent(arr) {
@@ -651,14 +636,10 @@ function safeSortContent(arr) {
 
   try {
     arr.sort(cmp);
-  } catch (e) {
-    // absolute fallback: no sort
-    console.warn("Sort failed, skipping:", e?.message || e);
-  }
+  } catch {}
 }
 
 function safeStringCompare(a, b) {
-  // Prefer zh collator, fallback to default, then lexicographic
   try {
     if (!_collatorZh) _collatorZh = new Intl.Collator("zh-Hans-CN", { numeric: true, sensitivity: "base" });
     return _collatorZh.compare(a, b);
@@ -714,9 +695,7 @@ function normalizeSubscribeContent(rawText) {
     if (!TV_LINE_PREFIX_RE.test(line)) continue;
 
     const pure = line.replace(/^📺[\uFE0E\uFE0F]?\s*/, "");
-    const match = pure.match(
-      /^(.+?)\s*\((\d{4})\)\s*(S\d+)\s*E?(\d+(?:-E?\d+)?)$/i
-    );
+    const match = pure.match(/^(.+?)\s*\((\d{4})\)\s*(S\d+)\s*E?(\d+(?:-E?\d+)?)$/i);
     if (!match) continue;
 
     result.push({
@@ -756,12 +735,6 @@ function escapeHtml(text) {
     .replace(/>/g, "&gt;");
 }
 
-function escapeHtmlAttr(text) {
-  return escapeHtml(text)
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
 function sanitizeHttpUrl(url) {
   const s = String(url || "").trim();
   if (!s) return "";
@@ -778,7 +751,6 @@ function sanitizeHttpUrl(url) {
 }
 
 function formatDateKey(date, timeZone) {
-  // YYYY-MM-DD
   return new Intl.DateTimeFormat("sv-SE", {
     timeZone,
     year: "numeric",

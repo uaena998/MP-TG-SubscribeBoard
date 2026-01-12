@@ -43,13 +43,16 @@ export default {
       const payload = await request.json();
       const { text: rawText, image } = extractTextAndImage(payload);
 
-      if (!isSubscribeReminder(rawText)) {
-        return jsonResponse({ success: true, result: "Skipped: Not SubscribeReminder" });
+      const classified = classifyEvent(rawText);
+      if (classified.type === "skip") {
+        return jsonResponse({ success: true, result: `Skipped: ${classified.reason || "Not target message"}` });
       }
 
-      const items = normalizeSubscribeContent(rawText);
+      const event = classified.type; // "subscribe" | "library"
+      const items = event === "subscribe" ? normalizeSubscribeContent(rawText) : normalizeLibraryContent(rawText);
+
       if (items.length === 0) {
-        return jsonResponse({ success: true, result: "Skipped: No valid episode lines" });
+        return jsonResponse({ success: true, result: `Skipped: No valid items (${event})` });
       }
 
       if (!env.SUBSCRIBE_BOARD) throw new Error("Missing Durable Object binding: SUBSCRIBE_BOARD");
@@ -64,7 +67,7 @@ export default {
       const doRes = await stub.fetch("https://do/aggregate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ dateKey, items, image }),
+        body: JSON.stringify({ dateKey, event, items, image: event === "subscribe" ? image : "" }),
       });
 
       const result = await safeJson(doRes);
@@ -118,7 +121,8 @@ export class SubscribeBoardDO {
     const preferPhoto = (this.env.PREFER_PHOTO_MESSAGE ?? "1") !== "0"; // default ON
     const allowTextToPhotoUpgrade = (this.env.ALLOW_TEXT_TO_PHOTO_UPGRADE ?? "1") !== "0"; // default ON
 
-    const { dateKey, items, image } = input || {};
+    const { dateKey, event = "subscribe", items, image } = input || {};
+    const eventType = event === "library" ? "library" : "subscribe"; // default to subscribe (back-compat)
     if (!dateKey || !Array.isArray(items)) throw new Error("Invalid payload to Durable Object");
 
     let state = (await this.state.storage.get("state")) || null;
@@ -134,54 +138,78 @@ export class SubscribeBoardDO {
         photoUrl: "",
         // dayImage: selected image for current day (used to update media at most once/day)
         dayImage: "",
+        // pendingLibrary: buffered "已入库" events keyed by dateKey (to handle early / cross-day events safely)
+        pendingLibrary: {},
       };
     } else {
       if (!Array.isArray(state.content)) state.content = [];
       if (!state.messageKind) state.messageKind = "unknown";
       if (typeof state.photoUrl !== "string") state.photoUrl = "";
       if (typeof state.dayImage !== "string") state.dayImage = "";
+      if (!state.pendingLibrary || typeof state.pendingLibrary !== "object") state.pendingLibrary = {};
     }
+
+    // Upgrade legacy content items (back-compat: {episode:'E13-E14'} -> range fields)
+    state.content = Array.isArray(state.content) ? state.content.map(upgradeContentItem).filter(Boolean) : [];
+    safeSortContent(state.content);
 
     let changed = false;
 
-    // Cross-day reset CONTENT only; keep messageId forever.
-    // For photo: we keep photoUrl (so message always has an image), but reset dayImage for daily selection.
-    if (state.dateKey !== dateKey) {
-      state.dateKey = dateKey;
-      state.content = [];
-      state.dayImage = "";
-      changed = true; // ensure first webhook updates dashboard
-    }
+    if (eventType === "library") {
+      // Cross-day: do NOT reset dashboard by library events.
+      // Buffer them and apply only when today's "电视剧更新" arrives.
+      const readyForToday = state.dateKey === dateKey && Array.isArray(state.content) && state.content.length > 0 && state.messageId;
 
-    // Merge items
-    for (const it of items) {
-      if (!it || typeof it !== "object") continue;
-      const title = String(it.title || "").trim();
-      const year = String(it.year || "").trim();
-      const season = String(it.season || "").trim().toUpperCase();
-      const episode = String(it.episode || "").trim().toUpperCase();
-      if (!title || !year || !season || !episode) continue;
+      if (!readyForToday) {
+        bufferLibraryItems(state, dateKey, items);
+        await this.state.storage.put("state", state);
+        return {
+          ok: true,
+          skipped: true,
+          reason: state.dateKey === dateKey ? "Buffered: dashboard not ready yet" : "Buffered: cross-day library event",
+          dateKey,
+          pendingCount: (state.pendingLibrary?.[dateKey] || []).length,
+        };
+      }
 
-      const key = `${title}|${year}|${season}`;
-      const idx = state.content.findIndex((v) => `${v.title}|${v.year}|${v.season}` === key);
-      const normalized = { title, year, season, episode };
+      const libChanged = applyLibraryItemsToContent(state.content, items);
+      if (!libChanged) {
+        await this.state.storage.put("state", state);
+        return { ok: true, skipped: true, reason: "Library: no matching episodes in today's list", dateKey, messageId: state.messageId };
+      }
+      changed = true;
+    } else {
+      // Subscribe reminder: this is the ONLY thing that can "start" a new day on dashboard
+      if (state.dateKey !== dateKey) {
+        state.dateKey = dateKey;
+        state.content = [];
+        state.dayImage = "";
+        // keep pending only for today (if exists)
+        const keep = state.pendingLibrary?.[dateKey];
+        state.pendingLibrary = keep ? { [dateKey]: keep } : {};
+        changed = true; // ensure first webhook updates dashboard
+      }
 
-      if (idx === -1) {
-        state.content.push(normalized);
-        changed = true;
-      } else if (String(episode).length > String(state.content[idx].episode || "").length) {
-        state.content[idx] = normalized;
+      // Merge subscribe items into state.content
+      const subChanged = mergeSubscribeItems(state.content, items);
+      if (subChanged) changed = true;
+
+      safeSortContent(state.content);
+
+      // Daily representative image: pick the first valid http/https we receive today (only from subscribe reminder)
+      const safeIncoming = sanitizeHttpUrl(image);
+      if (!state.dayImage && safeIncoming) {
+        state.dayImage = safeIncoming;
         changed = true;
       }
-    }
 
-    safeSortContent(state.content);
-
-    // Daily representative image: pick the first valid http/https we receive today
-    const safeIncoming = sanitizeHttpUrl(image);
-    if (!state.dayImage && safeIncoming) {
-      state.dayImage = safeIncoming;
-      changed = true;
+      // Apply buffered library items for today (if any)
+      const pending = Array.isArray(state.pendingLibrary?.[dateKey]) ? state.pendingLibrary[dateKey] : [];
+      if (pending.length) {
+        const applied = applyLibraryItemsToContent(state.content, pending);
+        if (applied) changed = true;
+        delete state.pendingLibrary[dateKey];
+      }
     }
 
     // If nothing changed and we already have a message, skip Telegram call
@@ -522,8 +550,13 @@ function buildCaptionHtml({ dateKey, updatedAt, content, budget, aggressive = fa
   const header = `🎬 <b>今日电视剧更新</b>`;
   const meta = `🗓 <b>${escapeHtml(dateKey)}</b>  ·  ⏱ <i>${escapeHtml(updatedAt)}</i>`;
 
-  const lines = (content || []).map(({ title, year, season, episode }) => {
-    return `📺 <b>${escapeHtml(title)}</b> (${escapeHtml(year)}) ${escapeHtml(season)}${escapeHtml(episode)}`;
+  const lines = (content || []).map((it) => {
+    const title = String(it?.title || "").trim();
+    const year = String(it?.year || "").trim();
+    const season = String(it?.season || "").trim().toUpperCase();
+
+    const episodeText = formatEpisodeWithProgress(it);
+    return `📺 <b>${escapeHtml(title)}</b> (${escapeHtml(year)}) ${escapeHtml(season)}${escapeHtml(episodeText)}`;
   });
 
   const placeholder = "（今日暂无更新）";
@@ -678,6 +711,7 @@ function extractTextAndImage(payload) {
   return { text: String(text || ""), image: String(image || "") };
 }
 
+
 function isSubscribeReminder(text) {
   if (!text) return false;
   if (!text.includes("电视剧更新")) return false;
@@ -686,6 +720,81 @@ function isSubscribeReminder(text) {
     .some((line) => TV_LINE_PREFIX_RE.test(String(line).trim()));
 }
 
+// Classify MoviePilot webhook message type
+function classifyEvent(text) {
+  const t = String(text || "");
+  if (!t.trim()) return { type: "skip", reason: "Empty text" };
+
+  // "已入库" is the only required keyword for library notifications
+  if (t.includes("已入库")) return { type: "library" };
+
+  // Ignore download start notifications
+  if (t.includes("开始下载")) return { type: "skip", reason: "Start download (ignored)" };
+
+  // Subscribe reminder (电视剧更新)
+  if (isSubscribeReminder(t)) return { type: "subscribe" };
+
+  return { type: "skip", reason: "Not SubscribeReminder / Not Library" };
+}
+
+// Normalize title for matching keys (also used for display)
+function normalizeTitleKey(title) {
+  return String(title || "")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function makeShowKey(title, year, season) {
+  return `${normalizeTitleKey(title)}|${String(year || "").trim()}|${String(season || "").trim().toUpperCase()}`;
+}
+
+function parseEpisodePart(part) {
+  const s = String(part || "").trim().toUpperCase();
+  const nums = s.match(/\d+/g) || [];
+  if (nums.length === 0) return null;
+
+  const fromStr = nums[0];
+  const toStr = nums.length >= 2 ? nums[nums.length - 1] : nums[0];
+
+  const from = Number.parseInt(fromStr, 10);
+  const to = Number.parseInt(toStr, 10);
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return null;
+
+  let epFrom = from;
+  let epTo = to;
+  let epFromStr = fromStr;
+  let epToStr = toStr;
+
+  if (epTo < epFrom) {
+    // swap
+    [epFrom, epTo] = [epTo, epFrom];
+    [epFromStr, epToStr] = [epToStr, epFromStr];
+  }
+
+  return { epFrom, epTo, epFromStr, epToStr };
+}
+
+function defaultPadEpisode(n) {
+  const num = Number(n);
+  if (!Number.isFinite(num)) return "00";
+  if (num >= 0 && num < 10) return "0" + String(num);
+  return String(num);
+}
+
+function formatEpisodeDisplay(it) {
+  const epFrom = Number(it?.epFrom);
+  const epTo = Number(it?.epTo);
+
+  const fromStr = typeof it?.epFromStr === "string" && it.epFromStr ? it.epFromStr : defaultPadEpisode(epFrom);
+  const toStr = typeof it?.epToStr === "string" && it.epToStr ? it.epToStr : defaultPadEpisode(epTo);
+
+  if (Number.isFinite(epFrom) && Number.isFinite(epTo) && epFrom !== epTo) {
+    return `E${fromStr}-E${toStr}`;
+  }
+  return `E${fromStr}`;
+}
+
+// SubscribeReminder: parse episode lines
 function normalizeSubscribeContent(rawText) {
   const lines = String(rawText || "").split("\n");
   const result = [];
@@ -695,18 +804,239 @@ function normalizeSubscribeContent(rawText) {
     if (!TV_LINE_PREFIX_RE.test(line)) continue;
 
     const pure = line.replace(/^📺[\uFE0E\uFE0F]?\s*/, "");
-    const match = pure.match(/^(.+?)\s*\((\d{4})\)\s*(S\d+)\s*E?(\d+(?:-E?\d+)?)$/i);
+    const match = pure.match(/^(.+?)\s*\((\d{4})\)\s*(S\d+)\s*E?(\d+(?:\s*-\s*E?\d+)?)$/i);
     if (!match) continue;
 
+    const title = match[1].trim();
+    const year = match[2].trim();
+    const season = match[3].trim().toUpperCase();
+
+    const epParsed = parseEpisodePart(match[4]);
+    if (!epParsed) continue;
+
     result.push({
-      title: match[1].trim(),
-      year: match[2],
-      season: match[3].toUpperCase(),
-      episode: "E" + String(match[4]).toUpperCase(),
+      title: normalizeTitleKey(title),
+      year,
+      season,
+      ...epParsed,
     });
   }
 
   return result;
+}
+
+// Library notification: parse "xxx (2022) S01E13 已入库" style line(s)
+function normalizeLibraryContent(rawText) {
+  const lines = String(rawText || "").split("\n");
+  const result = [];
+
+  for (let line of lines) {
+    line = String(line || "").trim();
+    if (!line || !line.includes("已入库")) continue;
+
+    // Typical patterns:
+    // "神印王座 (2022) S01 E193 已入库"
+    // "神印王座 (2022) S01E193 已入库"
+    // "神印王座 (2022) S01E13-E14 已入库"
+    const match = line.match(/^(.+?)\s*\((\d{4})\)\s*(S\d+)\s*E?(\d+(?:\s*-\s*E?\d+)?)\s*已入库/i);
+    if (!match) continue;
+
+    const title = match[1].trim();
+    const year = match[2].trim();
+    const season = match[3].trim().toUpperCase();
+
+    const epParsed = parseEpisodePart(match[4]);
+    if (!epParsed) continue;
+
+    result.push({
+      title: normalizeTitleKey(title),
+      year,
+      season,
+      ...epParsed,
+    });
+  }
+
+  return result;
+}
+
+// Upgrade any incoming / stored item to the latest schema
+function upgradeContentItem(it) {
+  if (!it || typeof it !== "object") return null;
+
+  const title = normalizeTitleKey(it.title);
+  const year = String(it.year || "").trim();
+  const season = String(it.season || "").trim().toUpperCase();
+  if (!title || !year || !season) return null;
+
+  let epFrom = it.epFrom;
+  let epTo = it.epTo;
+  let epFromStr = it.epFromStr;
+  let epToStr = it.epToStr;
+
+  const hasRange =
+    Number.isFinite(Number(epFrom)) &&
+    Number.isFinite(Number(epTo)) &&
+    typeof epFromStr === "string" &&
+    typeof epToStr === "string" &&
+    epFromStr &&
+    epToStr;
+
+  if (!hasRange) {
+    const legacy = String(it.episode || it.episodeDisplay || "").trim();
+    const parsed = parseEpisodePart(legacy);
+    if (parsed) {
+      epFrom = parsed.epFrom;
+      epTo = parsed.epTo;
+      epFromStr = parsed.epFromStr;
+      epToStr = parsed.epToStr;
+    } else {
+      // best-effort fallback
+      epFrom = Number.parseInt(String(epFrom || "0"), 10) || 0;
+      epTo = Number.parseInt(String(epTo || epFrom || "0"), 10) || epFrom;
+      epFromStr = String(epFrom);
+      epToStr = String(epTo);
+    }
+  }
+
+  let done = [];
+  if (Array.isArray(it.done)) {
+    done = it.done
+      .map((n) => Number.parseInt(String(n), 10))
+      .filter((n) => Number.isFinite(n));
+  }
+  done = Array.from(new Set(done)).sort((a, b) => a - b);
+
+  return { title, year, season, epFrom: Number(epFrom), epTo: Number(epTo), epFromStr: String(epFromStr), epToStr: String(epToStr), done };
+}
+
+// Merge subscribe reminder items into content (in-place)
+function mergeSubscribeItems(content, incoming) {
+  if (!Array.isArray(content) || !Array.isArray(incoming)) return false;
+
+  let changed = false;
+
+  for (const raw of incoming) {
+    const it = upgradeContentItem(raw);
+    if (!it) continue;
+
+    const key = makeShowKey(it.title, it.year, it.season);
+    const idx = content.findIndex((v) => makeShowKey(v.title, v.year, v.season) === key);
+
+    if (idx === -1) {
+      content.push({ ...it, done: Array.isArray(it.done) ? it.done : [] });
+      changed = true;
+      continue;
+    }
+
+    const existing = upgradeContentItem(content[idx]) || content[idx];
+
+    // decide whether to replace episode range (prefer wider / more informative)
+    const exLen = Math.max(1, Number(existing.epTo) - Number(existing.epFrom) + 1);
+    const inLen = Math.max(1, Number(it.epTo) - Number(it.epFrom) + 1);
+
+    const shouldReplace =
+      inLen > exLen ||
+      (inLen === exLen && Number(it.epTo) > Number(existing.epTo)) ||
+      (inLen === exLen && Number(it.epFrom) < Number(existing.epFrom));
+
+    if (shouldReplace) {
+      const preservedDone = Array.isArray(existing.done)
+        ? existing.done.filter((n) => n >= it.epFrom && n <= it.epTo)
+        : [];
+      content[idx] = { ...it, done: Array.from(new Set(preservedDone)).sort((a, b) => a - b) };
+      changed = true;
+    } else {
+      // keep existing but ensure we have done array
+      if (!Array.isArray(existing.done)) existing.done = [];
+      content[idx] = existing;
+    }
+  }
+
+  return changed;
+}
+
+// Apply library items to today's content (mark done episodes)
+function applyLibraryItemsToContent(content, libItems) {
+  if (!Array.isArray(content) || !Array.isArray(libItems)) return false;
+
+  let changed = false;
+
+  for (const raw of libItems) {
+    const lib = upgradeContentItem(raw);
+    if (!lib) continue;
+
+    const key = makeShowKey(lib.title, lib.year, lib.season);
+    const idx = content.findIndex((v) => makeShowKey(v.title, v.year, v.season) === key);
+    if (idx === -1) continue;
+
+    const item = upgradeContentItem(content[idx]) || content[idx];
+    if (!Array.isArray(item.done)) item.done = [];
+
+    const from = Math.max(Number(lib.epFrom), Number(item.epFrom));
+    const to = Math.min(Number(lib.epTo), Number(item.epTo));
+
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to < from) continue;
+
+    for (let ep = from; ep <= to; ep++) {
+      if (!item.done.includes(ep)) {
+        item.done.push(ep);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      item.done = Array.from(new Set(item.done)).sort((a, b) => a - b);
+    }
+
+    content[idx] = item;
+  }
+
+  return changed;
+}
+
+function bufferLibraryItems(state, dateKey, libItems) {
+  if (!state || typeof state !== "object") return;
+  if (!state.pendingLibrary || typeof state.pendingLibrary !== "object") state.pendingLibrary = {};
+
+  const dk = String(dateKey || "").trim();
+  if (!dk) return;
+  if (!Array.isArray(state.pendingLibrary[dk])) state.pendingLibrary[dk] = [];
+
+  const arr = state.pendingLibrary[dk];
+
+  // Keep unique by show+season+range (avoid infinite growth)
+  for (const raw of libItems || []) {
+    const it = upgradeContentItem(raw);
+    if (!it) continue;
+    const sig = `${makeShowKey(it.title, it.year, it.season)}|${it.epFrom}-${it.epTo}`;
+
+    const exists = arr.some((v) => {
+      const u = upgradeContentItem(v);
+      if (!u) return false;
+      return `${makeShowKey(u.title, u.year, u.season)}|${u.epFrom}-${u.epTo}` === sig;
+    });
+
+    if (!exists) arr.push(it);
+  }
+
+  // hard cap
+  if (arr.length > 200) {
+    state.pendingLibrary[dk] = arr.slice(arr.length - 200);
+  }
+}
+
+function formatEpisodeWithProgress(it) {
+  const item = upgradeContentItem(it) || it;
+  const episodeDisplay = formatEpisodeDisplay(item);
+
+  const total = Math.max(1, Number(item.epTo) - Number(item.epFrom) + 1);
+  const doneArr = Array.isArray(item.done) ? item.done : [];
+  const doneCount = doneArr.filter((n) => Number.isFinite(Number(n)) && Number(n) >= Number(item.epFrom) && Number(n) <= Number(item.epTo)).length;
+
+  if (!doneCount) return episodeDisplay;
+  if (total <= 1) return `${episodeDisplay} ✅`;
+
+  return `${episodeDisplay} (${doneCount}/${total}) ✅`;
 }
 
 // ============================================
